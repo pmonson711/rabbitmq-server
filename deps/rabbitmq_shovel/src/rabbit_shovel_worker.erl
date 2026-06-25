@@ -49,7 +49,7 @@ init([Type, Name, Config0]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_SHOVEL}),
     Config = case Type of
                 static ->
-                     Config0;
+                    decrypt_uris_in_config(Config0);
                 dynamic ->
                     ClusterName = rabbit_nodes:cluster_name(),
                      %% TODO It could handle errors while parsing
@@ -58,10 +58,18 @@ init([Type, Name, Config0]) ->
                     {ok, Mod} = rabbit_registry:lookup_module(runtime_parameter, shovel),
                     {ok, Conf} = Mod:parse(Name, ClusterName, Config0),
                     Conf
-            end,
+             end,
     ?LOG_DEBUG("Initialising a Shovel ~ts of type '~ts'", [human_readable_name(Name), Type]),
     gen_server2:cast(self(), init),
     {ok, #state{name = Name, type = Type, config = Config}}.
+
+decrypt_uris_in_config(#{source := #{uris := SrcUris} = Src,
+                         dest := #{uris := DstUris} = Dst} = Config)
+  when is_list(SrcUris), is_list(DstUris) ->
+    Config#{source => Src#{uris => [binary_to_list(credentials_obfuscation:decrypt(U)) || U <- SrcUris]},
+            dest => Dst#{uris => [binary_to_list(credentials_obfuscation:decrypt(U)) || U <- DstUris]}};
+decrypt_uris_in_config(Config) ->
+    Config.
 
 handle_call(_Msg, _From, State) ->
     {noreply, State}.
