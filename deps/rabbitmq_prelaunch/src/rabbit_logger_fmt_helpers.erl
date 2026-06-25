@@ -9,7 +9,8 @@
 
 -export([format_time/2,
          format_level/2,
-         format_msg/3]).
+         format_msg/3,
+         redact_credentials/1]).
 
 format_time(Timestamp, #{time_format := Format}) ->
     format_time1(Timestamp, Format);
@@ -147,7 +148,7 @@ format_msg1({string, Chardata}, Meta, Config) ->
     format_msg1({"~ts", [Chardata]}, Meta, Config);
 format_msg1({report, Report}, Meta, Config) ->
     FormattedReport = format_report(Report, Meta, Config),
-    format_msg1(FormattedReport, Meta, Config);
+    redact_credentials(format_msg1(FormattedReport, Meta, Config));
 format_msg1({Format, Args}, _, _) ->
     io_lib:format(Format, Args).
 
@@ -192,3 +193,14 @@ format_supervisor_progress(#{report := InternalReport}, _, _) ->
     Mfa = proplists:get_value(mfargs, Started),
     {"Supervisor ~w: child ~w started (~w): ~0p",
      [Supervisor, Id, Pid, Mfa]}.
+
+redact_credentials(Output) ->
+    case binary:match(iolist_to_binary(Output), <<"://">>) of
+        nomatch -> Output;
+        _ ->
+            re:replace(
+              Output,
+              "(amqp|amqps|mqtt|stomp)://[^:]+:[^@]+@",
+              "\\1://****:****@",
+              [{return, iodata}, global])
+    end.
