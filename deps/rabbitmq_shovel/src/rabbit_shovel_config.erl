@@ -133,15 +133,17 @@ parse_current(ShovelName, Config) ->
     DstMod = resolve_module(proplists:get_value(protocol, Destination, amqp091)),
     AckMode = proplists:get_value(ack_mode, Config, no_ack),
     validate_ack_mode(AckMode),
+    SrcParsed = rabbit_shovel_behaviour:parse(SrcMod, ShovelName, {source, Source}),
+    SrcEncrypted = encrypt_uris_in_config(SrcParsed),
+    DstParsed = rabbit_shovel_behaviour:parse(DstMod, ShovelName, {destination, Destination}),
+    DstEncrypted = encrypt_uris_in_config(DstParsed),
     {ok, #{name => ShovelName,
            shovel_type => static,
            ack_mode => AckMode,
            reconnect_delay => proplists:get_value(reconnect_delay, Config,
                                                   ?DEFAULT_RECONNECT_DELAY),
-           source => rabbit_shovel_behaviour:parse(SrcMod, ShovelName,
-                                                   {source, Source}),
-           dest => rabbit_shovel_behaviour:parse(DstMod, ShovelName,
-                                                 {destination, Destination})}}.
+           source => SrcEncrypted,
+           dest => DstEncrypted}}.
 
 %% ensures that any defaults that have been applied to a parsed
 %% shovel, are written back to the original proplist
@@ -162,6 +164,11 @@ validate_ack_mode(WrongVal) ->
     fail({invalid_parameter_value, ack_mode,
           {ack_mode_value_requires_one_of, {no_ack, on_publish, on_confirm},
           WrongVal}}).
+
+encrypt_uris_in_config(#{uris := URIs} = Config) when is_list(URIs) ->
+    Config#{uris => [credentials_obfuscation:encrypt(URI) || URI <- URIs]};
+encrypt_uris_in_config(Config) ->
+    Config.
 
 duplicate_keys(PropList) when is_list(PropList) ->
     proplists:get_keys(
