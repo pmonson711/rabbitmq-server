@@ -202,5 +202,5 @@ redact_credentials(Output) ->
               Output,
               "(amqp|amqps|mqtt|stomp)://[^:]+:[^@]+@",
               "\\1://****:****@",
-              [{return, iodata}, global])
+              [{return, list}, global])
     end.
