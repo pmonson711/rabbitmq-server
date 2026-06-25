@@ -138,10 +138,12 @@ parse_current(ShovelName, Config) ->
            ack_mode => AckMode,
            reconnect_delay => proplists:get_value(reconnect_delay, Config,
                                                   ?DEFAULT_RECONNECT_DELAY),
-           source => rabbit_shovel_behaviour:parse(SrcMod, ShovelName,
-                                                   {source, Source}),
-           dest => rabbit_shovel_behaviour:parse(DstMod, ShovelName,
-                                                 {destination, Destination})}}.
+           source => encrypt_uris_in_config(
+                       rabbit_shovel_behaviour:parse(SrcMod, ShovelName,
+                                                     {source, Source})),
+           dest => encrypt_uris_in_config(
+                     rabbit_shovel_behaviour:parse(DstMod, ShovelName,
+                                                   {destination, Destination}))}}.
 
 %% ensures that any defaults that have been applied to a parsed
 %% shovel, are written back to the original proplist
@@ -162,6 +164,11 @@ validate_ack_mode(WrongVal) ->
     fail({invalid_parameter_value, ack_mode,
           {ack_mode_value_requires_one_of, {no_ack, on_publish, on_confirm},
           WrongVal}}).
+
+encrypt_uris_in_config(#{uris := URIs} = Config) when is_list(URIs) ->
+    Config#{uris => [credentials_obfuscation:encrypt(URI) || URI <- URIs]};
+encrypt_uris_in_config(Config) ->
+    Config.
 
 duplicate_keys(PropList) when is_list(PropList) ->
     proplists:get_keys(
