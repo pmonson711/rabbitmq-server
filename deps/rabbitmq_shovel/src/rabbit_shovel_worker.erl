@@ -47,7 +47,7 @@ maybe_start_link(_, Type, Name, Config) ->
 
 init([Type, Name, Config0]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_SHOVEL}),
-    Config = case Type of
+    Config1 = case Type of
                 static ->
                      Config0;
                 dynamic ->
@@ -59,9 +59,23 @@ init([Type, Name, Config0]) ->
                     {ok, Conf} = Mod:parse(Name, ClusterName, Config0),
                     Conf
             end,
+    Config = case Type of
+                 static ->
+                     decrypt_uris_in_config(Config1);
+                 dynamic ->
+                     Config1
+             end,
     ?LOG_DEBUG("Initialising a Shovel ~ts of type '~ts'", [human_readable_name(Name), Type]),
     gen_server2:cast(self(), init),
     {ok, #state{name = Name, type = Type, config = Config}}.
+
+decrypt_uris_in_config(#{source := #{uris := SrcUris} = Src,
+                         dest := #{uris := DstUris} = Dst} = Config)
+  when is_list(SrcUris), is_list(DstUris) ->
+    Config#{source => Src#{uris => [binary_to_list(credentials_obfuscation:decrypt(U)) || U <- SrcUris]},
+            dest => Dst#{uris => [binary_to_list(credentials_obfuscation:decrypt(U)) || U <- DstUris]}};
+decrypt_uris_in_config(Config) ->
+    Config.
 
 handle_call(_Msg, _From, State) ->
     {noreply, State}.
