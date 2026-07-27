@@ -38,7 +38,11 @@ groups() ->
                   local_to_local_stream_credit_flow_no_ack,
                   local_to_local_simple_uri,
                   local_to_local_counters,
-                  local_to_local_alarms
+                  local_to_local_alarms,
+                  backpressure_non_confirm_blocks_unblocks,
+                  backpressure_quorum_queue_blocks_and_unblocks,
+                  local_to_local_quorum_on_publish,
+                  local_to_local_quorum_no_ack
                  ]}
     ].
 
@@ -290,6 +294,128 @@ local_to_local_alarms(Config) ->
               ?awaitMatch({running, running}, get_blocked_status(Config), 30000),
               amqp10_expect_count(Sess, DestAddress, 1000)
       end).
+local_to_local_quorum_on_publish(Config) ->
+    local_to_local_quorum(Config, <<"on-publish">>).
+
+local_to_local_quorum_no_ack(Config) ->
+    local_to_local_quorum(Config, <<"no-ack">>).
+
+backpressure_non_confirm_blocks_unblocks(Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, ?MODULE, backpressure_non_confirm_blocks_unblocks1, []).
+
+backpressure_non_confirm_blocks_unblocks1() ->
+    S0 = #{source => #{},
+           dest => #{blocked_queues => sets:new(),
+                     alarms => sets:new(),
+                     pending_delivery => lqueue:new()}},
+    S1 = rabbit_local_shovel:handle_dest_queue_actions(
+           [{block, <<"q1">>}], S0),
+    true = sets:is_element(
+             <<"q1">>,
+             maps:get(blocked_queues, maps:get(dest, S1))),
+    S2 = rabbit_local_shovel:handle_dest_queue_actions(
+           [{unblock, <<"q1">>}], S1),
+    true = sets:is_empty(
+            maps:get(blocked_queues, maps:get(dest, S2))),
+    ok.
+
+local_to_local_quorum(Config, AckMode) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    VHost = <<"/">>,
+    declare_queue(Config, VHost, Src, []),
+    declare_queue(Config, VHost, Dest, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
+    with_amqp10_session(
+      Config,
+      fun (Sess) ->
+              shovel_test_utils:set_param(Config, ?PARAM,
+                                          [{<<"src-protocol">>, <<"local">>},
+                                           {<<"src-queue">>, Src},
+                                           {<<"src-predeclared">>, true},
+                                           {<<"dest-protocol">>, <<"local">>},
+                                           {<<"dest-queue">>, Dest},
+                                           {<<"dest-predeclared">>, true},
+                                           {<<"ack-mode">>, AckMode}
+                                          ]),
+              SrcAddress = rabbitmq_amqp_address:queue(Src),
+              DestAddress = rabbitmq_amqp_address:queue(Dest),
+              Receiver = amqp10_subscribe(Sess, DestAddress),
+              amqp10_publish(Sess, SrcAddress, <<"tag1">>, 1000),
+              ?awaitMatch([{_Name, dynamic, {running, _}, #{forwarded := 1000}, _}],
+                          rabbit_ct_broker_helpers:rpc(Config, 0,
+                                                       rabbit_shovel_status, status, []),
+                          30000),
+              _ = amqp10_expect(Receiver, 1000, []),
+              amqp10_client:detach_link(Receiver)
+      end).
+
+backpressure_quorum_queue_blocks_and_unblocks(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    VHost = <<"/">>,
+    declare_queue(Config, VHost, Src, []),
+    declare_queue(Config, VHost, Dest, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
+    %% Lower the soft limit to 1 so {block, QName} fires on every
+    %% pending command, making the block state reliably observable.
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, application, set_env,
+           [rabbit, quorum_commands_soft_limit, 1]),
+    with_amqp10_session(
+      Config,
+      fun (Sess) ->
+              shovel_test_utils:set_param(Config, ?PARAM,
+                                          [{<<"src-protocol">>, <<"local">>},
+                                           {<<"src-queue">>, Src},
+                                           {<<"src-predeclared">>, true},
+                                           {<<"dest-protocol">>, <<"local">>},
+                                           {<<"dest-queue">>, Dest},
+                                           {<<"dest-predeclared">>, true},
+                                           {<<"ack-mode">>, <<"on-confirm">>}
+                                          ]),
+              SrcAddress = rabbitmq_amqp_address:queue(Src),
+              DestAddress = rabbitmq_amqp_address:queue(Dest),
+              Receiver = amqp10_subscribe(Sess, DestAddress),
+              amqp10_publish(Sess, SrcAddress, <<"tag1">>, 100),
+              %% Poll for blocked status while forwarding is in progress.
+              %% On main without the fix: is_blocked only checks alarms,
+              %% so blocked is never returned — WasBlocked stays false.
+              %% On the fix branch: is_blocked also checks blocked_queues,
+              %% so blocked is seen after every message sent.
+              WasBlocked = poll_until(
+                             fun() ->
+                                     case get_blocked_status(Config) of
+                                         {running, blocked} -> true;
+                                         _                  -> false
+                                     end
+                             end, 30000),
+              ?assert(WasBlocked),
+              ?awaitMatch([{_Name, dynamic, {running, _}, #{forwarded := 100}, _}],
+                          rabbit_ct_broker_helpers:rpc(Config, 0,
+                                                       rabbit_shovel_status, status, []),
+                          30000),
+              _ = amqp10_expect(Receiver, 100, []),
+              amqp10_client:detach_link(Receiver)
+      end).
+
+poll_until(Pred, Timeout) when Timeout > 0 ->
+    Start = erlang:monotonic_time(millisecond),
+    poll_until_loop(Pred, Start, Timeout).
+
+poll_until_loop(Pred, Start, Timeout) ->
+    case Pred() of
+        true ->
+            true;
+        false ->
+            Elapsed = erlang:monotonic_time(millisecond) - Start,
+            case Elapsed < Timeout of
+                true ->
+                    timer:sleep(100),
+                    poll_until_loop(Pred, Start, Timeout);
+                false ->
+                    false
+            end
+    end.
 %%----------------------------------------------------------------------------
 declare_queue(Config, VHost, QName) ->
     declare_queue(Config, VHost, QName, []).

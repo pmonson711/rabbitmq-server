@@ -58,9 +58,10 @@
          ack/3,
          nack/3,
          forward/3,
-         status/1,
-         pending_count/1
-        ]).
+          status/1,
+          pending_count/1,
+          handle_dest_queue_actions/2
+         ]).
 
 -export([
          src_decl_exchange/5,
@@ -387,9 +388,11 @@ init_dest(#{name := Name,
                       <<"x-opt-shovel-type">> => rabbit_data_coercion:to_binary(Type),
                       <<"x-opt-shovel-name">> => rabbit_data_coercion:to_binary(Name)},
             State#{dest => Dst#{cached_forward_headers => Props,
-                                alarms => Alarms}};
+                                alarms => Alarms,
+                                blocked_queues => sets:new()}};
         false ->
-            State#{dest => Dst#{alarms => Alarms}}
+            State#{dest => Dst#{alarms => Alarms,
+                                blocked_queues => sets:new()}}
     end.
 
 source_uri(_State) ->
@@ -478,6 +481,20 @@ handle_source({{'DOWN', #resource{name = Queue,
 handle_source(_Msg, _State) ->
     not_handled.
 
+handle_dest({queue_event, QRef, Evt},
+            #{ack_mode := AckMode,
+              dest := Dest = #{current := Current = #{queue_states := QueueStates0}}} = State0)
+        when AckMode =/= on_confirm ->
+    case rabbit_queue_type:handle_event(QRef, Evt, QueueStates0) of
+        {ok, QState1, Actions} ->
+            State = State0#{dest => Dest#{current => Current#{queue_states => QState1}}},
+            send_confirms_and_nacks(handle_dest_queue_actions(Actions, State));
+        {eol, Actions} ->
+            _ = send_confirms_and_nacks(handle_dest_queue_actions(Actions, State0)),
+            {stop, {outbound_link_or_channel_closure, queue_deleted}};
+        {protocol_error, _Type, Reason, ReasonArgs} ->
+            {stop, list_to_binary(io_lib:format(Reason, ReasonArgs))}
+    end;
 handle_dest({queue_event, QRef, Evt},
             #{ack_mode := on_confirm,
               dest := Dest = #{current := Current = #{queue_states := QueueStates0}}} = State0) ->
@@ -698,7 +715,18 @@ handle_dest_queue_actions(Actions, State) ->
                 end, {U0, []}, MsgSeqNos),
               S = S0#{dest => Dst#{unconfirmed => U}},
               record_rejects(Rej, S);
-         %% TODO handle {block, QName}
+         ({block, QName}, #{dest := Dst} = S0) ->
+              Blocked = maps:get(blocked_queues, Dst, sets:new()),
+              S1 = S0#{dest => Dst#{blocked_queues => sets:add_element(QName, Blocked)}},
+              pause_source(S1);
+         ({unblock, QName}, #{dest := Dst} = S0) ->
+              Blocked = maps:get(blocked_queues, Dst, sets:new()),
+              Blocked1 = sets:del_element(QName, Blocked),
+              S1 = S0#{dest => Dst#{blocked_queues => Blocked1}},
+              case sets:is_empty(Blocked1) of
+                  true  -> forward_pending_delivery(resume_source(S1));
+                  false -> S1
+              end;
          (_Action, S0) ->
               S0
       end, State, Actions).
@@ -938,6 +966,25 @@ maybe_grant_credit(#{source := #{queue_r := QName,
                                   }},
     handle_queue_actions(Actions, State).
 
+pause_source(#{source := Src = #{queue_r := QName,
+                                 current := Current = #{consumer_tag := CTag,
+                                                       queue_states := QState0}}} = State0) ->
+    {ok, QState, _Actions} = rabbit_queue_type:credit(QName, CTag, 0, 0, true, QState0),
+    State0#{source => Src#{current => Current#{queue_states => QState}}};
+pause_source(State) ->
+    State.
+
+resume_source(#{source := Src = #{queue_r := QName,
+                                  max_link_credit := MaxLinkCredit,
+                                  delivery_count := DeliveryCount,
+                                  current := Current = #{consumer_tag := CTag,
+                                                        queue_states := QState0}}} = State0) ->
+    {ok, QState, Actions} = rabbit_queue_type:credit(QName, CTag, DeliveryCount, MaxLinkCredit, false, QState0),
+    State = State0#{source => Src#{current => Current#{queue_states => QState}}},
+    handle_queue_actions(Actions, State);
+resume_source(State) ->
+    State.
+
 max_link_credit() ->
     application:get_env(rabbitmq_shovel, max_local_shovel_credit, ?DEFAULT_MAX_LINK_CREDIT).
 
@@ -1107,6 +1154,8 @@ messages_delivered(QName, S0) ->
             ok
     end.
 
+is_blocked(#{dest := #{alarms := Alarms, blocked_queues := Blocked}}) ->
+    not sets:is_empty(Alarms) orelse not sets:is_empty(Blocked);
 is_blocked(#{dest := #{alarms := Alarms}}) ->
     not sets:is_empty(Alarms);
 is_blocked(_) ->
@@ -1130,7 +1179,7 @@ forward_pending_delivery(State) ->
         empty ->
             State;
         {{Tag, Mc}, S} ->
-            S2 = do_forward(Tag, Mc, S),
+            S2 = forward(Tag, Mc, S),
             case is_blocked(S2) of
                 true ->
                     S2;
