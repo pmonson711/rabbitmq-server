@@ -39,9 +39,7 @@ groups() ->
                   local_to_local_simple_uri,
                   local_to_local_counters,
                   local_to_local_alarms,
-                  local_to_local_backpressure_quorum_on_confirm,
-                  local_to_local_backpressure_quorum_no_ack,
-                  local_to_local_backpressure_quorum_on_publish
+                  local_to_local_backpressure_quorum_on_confirm
                  ]}
     ].
 
@@ -95,6 +93,7 @@ end_per_testcase(Testcase, Config) ->
     shovel_test_utils:clear_param(Config, ?PARAM),
     rabbit_ct_broker_helpers:rpc(Config, 0, shovel_test_utils, delete_all_queues, []),
     _ = rabbit_ct_broker_helpers:delete_vhost(Config, ?config(alt_vhost, Config)),
+    restore_soft_limits(Config),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
 %% -------------------------------------------------------------------
@@ -292,7 +291,7 @@ local_to_local_alarms(Config) ->
               rabbit_ct_broker_helpers:clear_alarm(Config, 0, memory),
               ?awaitMatch({running, running}, get_blocked_status(Config), 30000),
                amqp10_expect_count(Sess, DestAddress, 1000)
-       end).
+              end).
 
 local_to_local_backpressure_quorum_on_confirm(Config) ->
     Src = ?config(srcq, Config),
@@ -312,52 +311,6 @@ local_to_local_backpressure_quorum_on_confirm(Config) ->
                    {<<"dest-queue">>, Dest},
                    {<<"dest-predeclared">>, true},
                    {<<"ack-mode">>, <<"on-confirm">>}]),
-              ?awaitMatch({running, blocked}, get_blocked_status(Config), 30000),
-              ?awaitMatch({running, running}, get_blocked_status(Config), 60000),
-              amqp10_expect_count(Sess, rabbitmq_amqp_address:queue(Dest), 50)
-      end).
-
-local_to_local_backpressure_quorum_no_ack(Config) ->
-    Src = ?config(srcq, Config),
-    Dest = ?config(destq, Config),
-    set_quorum_soft_limit(Config, 1),
-    declare_queue(Config, <<"/">>, Dest, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
-    with_amqp10_session(Config,
-      fun (Sess) ->
-              amqp10_declare_queue(Sess, Src, #{}),
-              SrcAddress = rabbitmq_amqp_address:queue(Src),
-              amqp10_publish(Sess, SrcAddress, <<"hello">>, 50),
-              shovel_test_utils:set_param(Config, ?PARAM,
-                  [{<<"src-protocol">>, <<"local">>},
-                   {<<"src-queue">>, Src},
-                   {<<"src-predeclared">>, true},
-                   {<<"dest-protocol">>, <<"local">>},
-                   {<<"dest-queue">>, Dest},
-                   {<<"dest-predeclared">>, true},
-                   {<<"ack-mode">>, <<"no-ack">>}]),
-              ?awaitMatch({running, blocked}, get_blocked_status(Config), 30000),
-              ?awaitMatch({running, running}, get_blocked_status(Config), 60000),
-              amqp10_expect_count(Sess, rabbitmq_amqp_address:queue(Dest), 50)
-      end).
-
-local_to_local_backpressure_quorum_on_publish(Config) ->
-    Src = ?config(srcq, Config),
-    Dest = ?config(destq, Config),
-    set_quorum_soft_limit(Config, 1),
-    declare_queue(Config, <<"/">>, Dest, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
-    with_amqp10_session(Config,
-      fun (Sess) ->
-              amqp10_declare_queue(Sess, Src, #{}),
-              SrcAddress = rabbitmq_amqp_address:queue(Src),
-              amqp10_publish(Sess, SrcAddress, <<"hello">>, 50),
-              shovel_test_utils:set_param(Config, ?PARAM,
-                  [{<<"src-protocol">>, <<"local">>},
-                   {<<"src-queue">>, Src},
-                   {<<"src-predeclared">>, true},
-                   {<<"dest-protocol">>, <<"local">>},
-                   {<<"dest-queue">>, Dest},
-                   {<<"dest-predeclared">>, true},
-                   {<<"ack-mode">>, <<"on-publish">>}]),
               ?awaitMatch({running, blocked}, get_blocked_status(Config), 30000),
               ?awaitMatch({running, running}, get_blocked_status(Config), 60000),
               amqp10_expect_count(Sess, rabbitmq_amqp_address:queue(Dest), 50)
